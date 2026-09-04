@@ -36,8 +36,10 @@ class S3Collector(BaseCollector):
             if 'Contents' in objs:
                 latest = max(objs['Contents'], key=lambda x: x['LastModified'])
                 evidence.append({
-                    "source": "S3_OBJECT", "category": "DATA_PLANE",
-                    "data": f"Latest Object Modified: {latest['LastModified']}"
+                    "source": "S3_OBJECT", 
+                    "category": "DATA_PLANE",
+                    "event_name": "LatestObjectModified",
+                    "event_time": str(latest['LastModified'])
                 })
         except Exception:
             pass

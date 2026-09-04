@@ -11,6 +11,10 @@ def process_collector(collector, diff_engine, ingestor, resource_type, arn_prefi
     items = collector.discover_all()
     print(f"\n=== [{resource_type.upper()}] 리소스 스캔 (총 {len(items)}개) ===")
 
+    # 해당 리소스 타입의 기존 파일 유무로 최초 실행 여부 판단
+    existing_files = [f for f in os.listdir(baseline_dir) if f.startswith(f"baseline_{resource_type}_")]
+    is_first_run = len(existing_files) == 0
+
     for name in items:
         baseline_path = os.path.join(baseline_dir, f"baseline_{resource_type}_{name}.json")
         current_state = collector.get_state(name)
@@ -18,7 +22,24 @@ def process_collector(collector, diff_engine, ingestor, resource_type, arn_prefi
         if not os.path.exists(baseline_path):
             with open(baseline_path, "w") as f:
                 json.dump(current_state, f)
-            print(f"[{resource_type}:{name}] 초기 Baseline 생성 완료.")
+            
+            # 최초 실행이 아닌데 파일이 없다면 -> 신규 리소스 생성 (공격)
+            if not is_first_run:
+                print(f"[!] {resource_type.upper()} ({name}) 신규 리소스 생성 감지됨!")
+                diffs = [{
+                    "change_type": "add", 
+                    "json_path": "Resource", 
+                    "before_val": "NONE", 
+                    "after_val": "CREATED"
+                }]
+                evidence = collector.collect_evidence(name)
+                evidence.extend(collector.collect_immutable_trail(name))
+                
+                arn = f"{arn_prefix}:{name}"
+                ingestor.create_change_graph(arn, diffs, evidence)
+                print(f"[{name}] 신규 생성 그래프 적재 완료.")
+            else:
+                print(f"[{resource_type}:{name}] 초기 Baseline 생성 완료.")
             continue
 
         with open(baseline_path, "r") as f:
@@ -45,7 +66,6 @@ def main():
     ingestor = Neo4jIngestor("bolt://localhost:7687", "neo4j", "YourSecurePassword123")
     os.makedirs("data", exist_ok=True)
 
-    # 리소스별 수집기 인스턴스화
     collectors = [
         (S3Collector(), "s3", "arn:aws:s3:::"),
         (EC2Collector(), "ec2", "arn:aws:ec2:instance"),

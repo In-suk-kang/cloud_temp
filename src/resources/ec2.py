@@ -36,8 +36,10 @@ class EC2Collector(BaseCollector):
             res = self.ec2.describe_instances(InstanceIds=[instance_id])
             inst = res['Reservations'][0]['Instances'][0]
             evidence.append({
-                "source": "EC2_META", "category": "COMPUTE_PLANE",
-                "data": f"LaunchTime: {str(inst.get('LaunchTime'))}"
+                "source": "EC2_META", 
+                "category": "COMPUTE_PLANE",
+                "event_name": "InstanceLaunched",
+                "event_time": str(inst.get('LaunchTime'))
             })
         except Exception:
             pass

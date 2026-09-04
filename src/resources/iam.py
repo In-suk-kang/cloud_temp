@@ -31,8 +31,10 @@ class IAMCollector(BaseCollector):
             res = self.iam.get_role(RoleName=role_name)
             create_date = res['Role'].get('CreateDate')
             evidence.append({
-                "source": "IAM_META", "category": "CONTROL_PLANE",
-                "data": f"Role CreateDate: {str(create_date)}"
+                "source": "IAM_META", 
+                "category": "CONTROL_PLANE",
+                "event_name": "RoleCreated",
+                "event_time": str(create_date)
             })
         except Exception:
             pass
