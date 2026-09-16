@@ -1,85 +1,134 @@
-import json
-from pathlib import Path
-from neo4j import GraphDatabase
+"""
+neo4j_loader-v3.py - AWS Security Snapshot Analysis Pipeline (Refactored v3)
+Loads generated Cypher queries (diff.cypher) into Neo4j Graph Database safely without comment execution errors.
+"""
 
-# Neo4j 연결 설정 (Aura 또는 Local)
-URI = "bolt://localhost:7687"
-AUTH = ("neo4j", "YourSecurePassword123")
+import argparse
+import logging
+import os
+import sys
 
-BASE_DIR = Path(__file__).resolve().parent
-DIFFS_DIR = BASE_DIR / "diffs"
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("neo4j_loader")
 
-def get_latest_diff_file():
-    files = sorted(DIFFS_DIR.glob("diff_*.json"))
-    if not files:
-        raise FileNotFoundError("분석된 diff 파일이 없습니다. diff.py를 먼저 실행하세요.")
-    return files[-1]
 
-def load_diff_data(filepath):
-    with open(filepath, "r", encoding="utf-8") as f:
-        return json.load(f)
+class Neo4jGraphLoader:
+    """Handles connection and batch Cypher query execution against Neo4j DB."""
 
-def ingest_to_neo4j(tx, resource_name, diff_data):
-    """
-    Diff 데이터를 분석하여 Neo4j에 노드와 관계를 생성하는 Cypher 쿼리 실행
-    """
-    if resource_name == "IAM":
-        # 추가된 IAM Role 처리
-        roles = diff_data.get("diff", {}).get("roles", {})
-        for added_role in roles.get("added", []):
-            role_id = added_role["resource_id"]
-            role = added_role["resource"]
-            role_name = role["role_name"]
-            arn = role["arn"]
-            
-            # 1. Role 노드 생성
-            query_role = """
-            MERGE (r:IAMRole {role_id: $role_id})
-            ON CREATE SET r.name = $role_name, r.arn = $arn, r.state = 'ADDED'
-            """
-            tx.run(query_role, role_id=role_id, role_name=role_name, arn=arn)
-            
-            # 2. 부착된 정책(Attached Policies) 연결
-            for policy in role.get("attached_policies", []):
-                policy_name = policy["PolicyName"]
-                query_policy = """
-                MATCH (r:IAMRole {role_id: $role_id})
-                MERGE (p:IAMPolicy {name: $policy_name})
-                MERGE (r)-[:ATTACHED_POLICY]->(p)
-                """
-                tx.run(query_policy, role_id=role_id, policy_name=policy_name)
+    def __init__(self, uri: str, user: str, passw: str):
+        self.uri = uri
+        self.user = user
+        self.passw = passw
+        self.driver = None
 
-    elif resource_name == "CLOUDTRAIL":
-        # CloudTrail 로깅 상태 변경 처리 (Defense Evasion 탐지)
-        changes = diff_data.get("diff", {}).get("changed", [])
-        for change in changes:
-            trail_arn = change["resource_id"]
-            for sub_change in change.get("changes", []):
-                if sub_change["path"] == "status.is_logging":
-                    before_val = sub_change["before"]
-                    after_val = sub_change["after"]
-                    
-                    query_ct = """
-                    MERGE (ct:CloudTrail {arn: $trail_arn})
-                    SET ct.is_logging = $after_val
-                    CREATE (ct)-[:STATE_DRIFT {type: 'DISABLED_LOGGING', before: $before_val, after: $after_val}]->(s:SecurityAlert {description: 'CloudTrail Logging Stopped'})
-                    """
-                    tx.run(query_ct, trail_arn=trail_arn, before_val=str(before_val), after_val=str(after_val))
+    def connect(self):
+        """Establish connection to Neo4j instance."""
+        try:
+            from neo4j import GraphDatabase, exceptions
+        except ImportError:
+            logger.error("The 'neo4j' Python driver is not installed. Please install it via: pip install neo4j")
+            sys.exit(1)
+
+        try:
+            logger.info(f"Connecting to Neo4j database at '{self.uri}'...")
+            self.driver = GraphDatabase.driver(self.uri, auth=(self.user, self.passw))
+            self.driver.verify_connectivity()
+            logger.info("Successfully connected and verified Neo4j connection.")
+        except exceptions.Neo4jError as e:
+            logger.error(f"Failed to connect to Neo4j database: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected connection error: {e}")
+            raise
+
+    def close(self):
+        """Close driver connection."""
+        if self.driver:
+            self.driver.close()
+            logger.info("Neo4j connection driver closed.")
+
+    @staticmethod
+    def _clean_and_validate_statement(stmt: str) -> str:
+        """Strip single-line comments and return executable Cypher code."""
+        lines = [line for line in stmt.splitlines() if not line.strip().startswith("//")]
+        return "\n".join(lines).strip()
+
+    def execute_cypher_script(self, script_path: str):
+        """Read and execute Cypher statements from script_path."""
+        if not os.path.exists(script_path):
+            logger.error(f"Cypher script file '{script_path}' not found.")
+            raise FileNotFoundError(f"Required input Cypher file '{script_path}' does not exist.")
+
+        logger.info(f"Reading Cypher script from '{script_path}'...")
+        with open(script_path, "r", encoding="utf-8") as f:
+            cypher_content = f.read()
+
+        # Split individual Cypher statements by semicolon
+        raw_statements = cypher_content.split(";")
+        executable_statements = []
+
+        for stmt in raw_statements:
+            cleaned = self._clean_and_validate_statement(stmt)
+            if cleaned:
+                executable_statements.append(cleaned)
+
+        if not executable_statements:
+            logger.warning("No executable Cypher statements found in file.")
+            return
+
+        logger.info(f"Found {len(executable_statements)} executable Cypher statements to run.")
+
+        success_count = 0
+        error_count = 0
+
+        try:
+            from neo4j import exceptions
+        except ImportError:
+            logger.error("The 'neo4j' Python driver is not installed.")
+            sys.exit(1)
+
+        with self.driver.session() as session:
+            for idx, stmt in enumerate(executable_statements, 1):
+                try:
+                    session.run(stmt)
+                    success_count += 1
+                except exceptions.CypherSyntaxError as e:
+                    logger.error(f"Syntax error in Cypher statement #{idx}: {e}")
+                    logger.debug(f"Failed statement text: {stmt}")
+                    error_count += 1
+                except exceptions.Neo4jError as e:
+                    logger.error(f"Database error executing statement #{idx}: {e}")
+                    error_count += 1
+                except Exception as e:
+                    logger.error(f"Unexpected error executing statement #{idx}: {e}")
+                    error_count += 1
+
+        logger.info(f"Cypher script execution complete. Success: {success_count}, Failures: {error_count}")
+        if error_count > 0:
+            logger.warning(f"Completed with {error_count} errors.")
+
 
 def main():
-    diff_file = get_latest_diff_file()
-    print(f"[+] Load Diff File: {diff_file}")
-    data = load_diff_data(diff_file)
-    
-    driver = GraphDatabase.driver(URI, auth=AUTH)
-    
-    with driver.session() as session:
-        for resource_name, resource_content in data.get("resources", {}).items():
-            print(f"[*] Processing Neo4j ingestion for: {resource_name}")
-            session.execute_write(ingest_to_neo4j, resource_name, resource_content)
-            
-    driver.close()
-    print("[+] Neo4j Graph Ingestion Complete!")
+    parser = argparse.ArgumentParser(description="Load Cypher script into Neo4j Graph Database.")
+    parser.add_argument("--uri", default=os.getenv("NEO4J_URI", "bolt://localhost:7687"), help="Neo4j connection URI (Default: bolt://localhost:7687)")
+    parser.add_argument("--user", default=os.getenv("NEO4J_USER", "neo4j"), help="Neo4j username (Default: neo4j)")
+    parser.add_argument("--password", default=os.getenv("NEO4J_PASSWORD", "password"), help="Neo4j password")
+    parser.add_argument("--input", default="diff.cypher", help="Path to input diff.cypher file (Default: diff.cypher)")
+
+    args = parser.parse_args()
+
+    loader = Neo4jGraphLoader(uri=args.uri, user=args.user, passw=args.password)
+    try:
+        loader.connect()
+        loader.execute_cypher_script(args.input)
+    finally:
+        loader.close()
+
 
 if __name__ == "__main__":
     main()
