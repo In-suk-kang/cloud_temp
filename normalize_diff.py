@@ -1,205 +1,278 @@
 """
-snapshot diff (before/after) -> Neo4j 적재용 정규화 스크립트
-
-입력: analysis_timestamp/resources 구조를 가진 diff JSON
-출력:
-  - nodes_resources.csv   : 리소스 노드
-  - nodes_entities.csv    : ARN/계정ID 등 추출된 엔티티 노드 (Account, Policy 등)
-  - events.csv            : 정규화된 변경 이벤트 (ChangeEvent 노드)
-  - rel_resource_event.csv    : (Resource)-[:HAS_EVENT]->(ChangeEvent)
-  - rel_resource_entity.csv   : (Resource)-[:REFERENCES]->(Entity)  (예: TRUSTS, GRANTS_ACCESS_TO)
-
-사용법:
-  python normalize_diff.py diff.json ./out_dir
+normalize_diff-v2.py - AWS Security Snapshot Analysis Pipeline (Refactored)
+Normalizes raw diff.json into standardized Node and Relationship graph schemas for Neo4j.
 """
 
 import json
-import re
+import logging
+import os
 import sys
-import csv
-import hashlib
-from pathlib import Path
+from typing import Dict, List, Any, Optional, Union
 
-# ---------------------------------------------------------------------------
-# 1. 노이즈 필드 필터 (AWS API 호출마다 값이 바뀌는, 보안적으로 무의미한 필드)
-# ---------------------------------------------------------------------------
-NOISE_PATH_PATTERNS = [
-    r"ResponseMetadata",
-    r"HTTPHeaders",
-    r"x-amz-request-id",
-    r"x-amz-id-2",
-    r"HostId",
-    r"RequestId",
-    r"^date$",
-]
-NOISE_RE = re.compile("|".join(NOISE_PATH_PATTERNS), re.IGNORECASE)
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("normalize_diff")
 
-def is_noise(field_path: str) -> bool:
-    return bool(NOISE_RE.search(field_path or ""))
 
-# ---------------------------------------------------------------------------
-# 2. 리스크 태깅 규칙 (필요에 맞게 계속 추가하면 됨)
-# ---------------------------------------------------------------------------
-def tag_risk(resource_type, field_path, before, after):
-    tags = []
-    blob = json.dumps({"path": field_path, "before": before, "after": after}, default=str)
+class SchemaNormalizer:
+    """Normalizes raw diff data into a uniform Graph Schema (Nodes and Relationships)."""
 
-    if resource_type == "IAM" and "AdministratorAccess" in blob:
-        tags.append("PRIVILEGE_ESCALATION")
-    if resource_type == "CLOUDTRAIL" and field_path.endswith("is_logging") and after is False:
-        tags.append("DEFENSE_EVASION_LOGGING_DISABLED")
-    if resource_type == "S3" and field_path == "bucket_policy" and before is None and after:
-        tags.append("S3_POLICY_GRANTED")
-    if re.search(r'"AWS":\s*"arn:aws:iam::\d+:root"', blob):
-        tags.append("EXTERNAL_PRINCIPAL_TRUST")
-    return tags
+    def __init__(self, account_id: str = "123456789012", region: str = "ap-northeast-2"):
+        self.account_id = account_id
+        self.region = region
+        self.nodes: List[Dict[str, Any]] = []
+        self.relationships: List[Dict[str, Any]] = []
 
-# ---------------------------------------------------------------------------
-# 3. ARN / 계정ID 추출 (그래프 엣지의 핵심 연결 키)
-# ---------------------------------------------------------------------------
-ARN_RE = re.compile(r"arn:aws:[a-zA-Z0-9\-]+:[a-zA-Z0-9\-]*:\d{12}:[^\s\"'\\]+")
-ACCOUNT_RE = re.compile(r"\b\d{12}\b")
-
-def extract_entities(before, after):
-    blob = json.dumps({"before": before, "after": after}, default=str)
-    arns = set(ARN_RE.findall(blob))
-    accounts = set(ACCOUNT_RE.findall(blob))
-    entities = []
-    for arn in arns:
-        entities.append(("ARN", arn))
-    for acct in accounts:
-        entities.append(("ACCOUNT", acct))
-    return entities
-
-def rel_type_for_entity(entity_type, risk_tags):
-    if "EXTERNAL_PRINCIPAL_TRUST" in risk_tags:
-        return "TRUSTS"
-    if "S3_POLICY_GRANTED" in risk_tags:
-        return "GRANTS_ACCESS_TO"
-    return "REFERENCES"
-
-# ---------------------------------------------------------------------------
-# 4. 평탄화: added/removed/changed 구조를 공통 이벤트 리스트로 변환
-# ---------------------------------------------------------------------------
-def event_id(*parts):
-    return hashlib.sha1("|".join(str(p) for p in parts).encode()).hexdigest()[:16]
-
-def walk_changed_list(node, prefix=""):
-    """resources.<TYPE>.diff 안의 {added, removed, changed} 혹은
-    IAM처럼 {users:{added,removed,changed}, roles:{...}} 형태를 모두 지원."""
-    out = []
-    if isinstance(node, dict) and {"added", "removed", "changed"} <= set(node.keys()):
-        for item in node.get("added", []):
-            out.append(("ADDED", item.get("resource_id"), None, None, item.get("resource")))
-        for item in node.get("removed", []):
-            out.append(("REMOVED", item.get("resource_id"), None, item.get("resource"), None))
-        for item in node.get("changed", []):
-            rid = item.get("resource_id")
-            for ch in item.get("changes", []):
-                out.append((ch.get("type", "CHANGED"), rid, ch.get("path"), ch.get("before"), ch.get("after")))
-    elif isinstance(node, dict):
-        # 하위 카테고리(users/groups/roles 등)를 재귀 처리
-        for k, v in node.items():
-            out.extend(walk_changed_list(v, prefix=f"{prefix}.{k}" if prefix else k))
-    return out
-
-def normalize(diff_json):
-    resources_rows = []
-    events_rows = []
-    entity_rows = {}   # key -> (type, value)
-    rel_resource_event = []
-    rel_resource_entity = []
-
-    ts = diff_json.get("analysis_timestamp")
-
-    for rtype, rblock in diff_json.get("resources", {}).items():
-        after_ts = rblock.get("after_timestamp", ts)
-        diff = rblock.get("diff", {})
-        raw_events = walk_changed_list(diff)
-
-        for change_type, rid, field_path, before, after in raw_events:
-            if rid is None:
+    def sanitize_properties(self, props: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert nested dicts/lists into Neo4j primitive-compatible formats."""
+        sanitized = {}
+        for key, val in props.items():
+            if val is None:
                 continue
-            resources_rows.append({"resource_id": rid, "resource_type": rtype})
+            if isinstance(val, (str, int, float, bool)):
+                sanitized[key] = val
+            elif isinstance(val, (dict, list)):
+                sanitized[key] = json.dumps(val, ensure_ascii=False, default=str)
+            else:
+                sanitized[key] = str(val)
+        return sanitized
 
-            noise = is_noise(field_path or "")
+    def format_arn(self, service: str, resource_type: str, resource_id: str) -> str:
+        """Generate deterministic ARN / Unique Identifier for resources."""
+        if str(resource_id).startswith("arn:aws:"):
+            return str(resource_id)
+        if service == "s3":
+            return f"arn:aws:s3:::{resource_id}"
+        if service == "iam":
+            return f"arn:aws:iam::{self.account_id}:{resource_type}/{resource_id}"
+        return f"arn:aws:{service}:{self.region}:{self.account_id}:{resource_type}/{resource_id}"
 
-            # 노이즈 필드(ResponseMetadata 등)는 그래프에 올릴 가치가 없으므로
-            # 여기서 완전히 스킵한다. 감사 추적이 필요하면 원본 JSON을 별도 보관.
-            if noise:
-                continue
+    def add_node(self, node_id: str, labels: List[str], change_type: str, props: Dict[str, Any]):
+        """Register a normalized node with deduplication."""
+        # Avoid exact duplicate node entries
+        for existing in self.nodes:
+            if existing["id"] == node_id and existing["change_type"] == change_type:
+                existing["properties"].update(self.sanitize_properties(props))
+                return
 
-            risk_tags = tag_risk(rtype, field_path or "", before, after)
-            eid = event_id(rtype, rid, field_path, change_type, after_ts)
+        self.nodes.append({
+            "id": node_id,
+            "labels": labels,
+            "change_type": change_type,  # 'ADDED', 'REMOVED', 'MODIFIED'
+            "properties": self.sanitize_properties(props)
+        })
 
-            events_rows.append({
-                "event_id": eid,
-                "resource_type": rtype,
-                "resource_id": rid,
-                "change_type": change_type,
-                "field_path": field_path or "(whole_resource)",
-                "before": json.dumps(before, default=str) if not isinstance(before, str) else before,
-                "after": json.dumps(after, default=str) if not isinstance(after, str) else after,
-                "timestamp": after_ts,
-                "risk_tags": ";".join(risk_tags),
-            })
-            rel_resource_event.append({"resource_id": rid, "event_id": eid})
+    def add_relationship(self, source_id: str, target_id: str, rel_type: str, change_type: str, props: Optional[Dict[str, Any]] = None):
+        """Register a normalized relationship."""
+        rel_entry = {
+            "source": source_id,
+            "target": target_id,
+            "type": rel_type,
+            "change_type": change_type,
+            "properties": self.sanitize_properties(props or {})
+        }
+        if rel_entry not in self.relationships:
+            self.relationships.append(rel_entry)
 
-            for etype, eval_ in extract_entities(before, after):
-                key = f"{etype}:{eval_}"
-                entity_rows[key] = {"entity_type": etype, "value": eval_}
-                rel_resource_entity.append({
-                    "resource_id": rid,
-                    "entity_key": key,
-                    "rel_type": rel_type_for_entity(etype, risk_tags),
-                    "event_id": eid,
-                })
+    @staticmethod
+    def _to_list(data: Union[List, Dict]) -> List[Dict]:
+        """Ensure input data is safely iterable as a list of dicts."""
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        elif isinstance(data, dict):
+            items = []
+            for k, v in data.items():
+                if isinstance(v, list):
+                    items.extend([x for x in v if isinstance(x, dict)])
+                elif isinstance(v, dict):
+                    items.append(v)
+            return items if items else [data]
+        return []
 
-    # 리소스 중복 제거
-    dedup_resources = {r["resource_id"]: r for r in resources_rows}
+    # --- Service Specific Normalizers ---
 
-    return {
-        "resources": list(dedup_resources.values()),
-        "entities": [{"entity_key": k, **v} for k, v in entity_rows.items()],
-        "events": events_rows,
-        "rel_resource_event": rel_resource_event,
-        "rel_resource_entity": rel_resource_entity,
-    }
+    def normalize_iam(self, iam_diff: Dict[str, Any]):
+        """Normalize IAM Users, Groups, Roles, Policies and their attachments."""
+        for change_type in ["added", "removed", "modified"]:
+            raw_data = iam_diff.get(change_type, {})
+            action = change_type.upper()
 
-# ---------------------------------------------------------------------------
-# 5. CSV 출력 (Neo4j LOAD CSV / neo4j-admin import 로 바로 사용 가능)
-# ---------------------------------------------------------------------------
-def write_csv(path, rows):
-    if not rows:
-        return
-    keys = list(rows[0].keys())
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        w.writerows(rows)
+            # Process User entries
+            users = self._to_list(raw_data.get("users", []) if isinstance(raw_data, dict) else raw_data)
+            for user in users:
+                user_name = user.get("UserName", "Unknown")
+                user_arn = user.get("Arn") or self.format_arn("iam", "user", user_name)
+                
+                self.add_node(
+                    node_id=user_arn,
+                    labels=["Resource", "IAM", "IAMUser"],
+                    change_type=action,
+                    props={"UserName": user_name, "UserId": user.get("UserId", "")}
+                )
+
+                for pol in user.get("AttachedPolicies", []):
+                    pol_arn = pol.get("PolicyArn") if isinstance(pol, dict) else str(pol)
+                    if pol_arn:
+                        self.add_relationship(user_arn, pol_arn, "HAS_POLICY", action)
+
+            # Process Role entries
+            roles = self._to_list(raw_data.get("roles", []) if isinstance(raw_data, dict) else raw_data)
+            for role in roles:
+                role_name = role.get("RoleName", "Unknown")
+                role_arn = role.get("Arn") or self.format_arn("iam", "role", role_name)
+                
+                self.add_node(
+                    node_id=role_arn,
+                    labels=["Resource", "IAM", "IAMRole"],
+                    change_type=action,
+                    props={"RoleName": role_name, "RoleId": role.get("RoleId", "")}
+                )
+
+                for pol in role.get("AttachedPolicies", []):
+                    pol_arn = pol.get("PolicyArn") if isinstance(pol, dict) else str(pol)
+                    if pol_arn:
+                        self.add_relationship(role_arn, pol_arn, "HAS_POLICY", action)
+
+    def normalize_s3(self, s3_diff: Dict[str, Any]):
+        """Normalize S3 Bucket configurations & security settings."""
+        for change_type in ["added", "removed", "modified"]:
+            raw_data = s3_diff.get(change_type, {})
+            action = change_type.upper()
+
+            buckets = self._to_list(raw_data.get("buckets", raw_data) if isinstance(raw_data, dict) else raw_data)
+            for bucket in buckets:
+                b_name = bucket.get("Name") or bucket.get("BucketName", "Unknown")
+                b_arn = self.format_arn("s3", "bucket", b_name)
+
+                props = {
+                    "BucketName": b_name,
+                    "PublicAccessBlock": bucket.get("PublicAccessBlock", {}),
+                    "Encryption": bucket.get("Encryption", {})
+                }
+                
+                self.add_node(
+                    node_id=b_arn,
+                    labels=["Resource", "S3", "S3Bucket"],
+                    change_type=action,
+                    props=props
+                )
+
+    def normalize_security_groups(self, sg_diff: Dict[str, Any]):
+        """Normalize Security Groups and Network Rules."""
+        for change_type in ["added", "removed", "modified"]:
+            raw_data = sg_diff.get(change_type, {})
+            action = change_type.upper()
+
+            sgs = self._to_list(raw_data.get("security_groups", raw_data) if isinstance(raw_data, dict) else raw_data)
+            for sg in sgs:
+                sg_id = sg.get("GroupId", "sg-unknown")
+                sg_arn = self.format_arn("ec2", "security-group", sg_id)
+
+                self.add_node(
+                    node_id=sg_arn,
+                    labels=["Resource", "EC2", "SecurityGroup"],
+                    change_type=action,
+                    props={
+                        "GroupId": sg_id,
+                        "GroupName": sg.get("GroupName", ""),
+                        "VpcId": sg.get("VpcId", "")
+                    }
+                )
+
+                if sg.get("VpcId"):
+                    vpc_arn = self.format_arn("ec2", "vpc", sg.get("VpcId"))
+                    self.add_relationship(sg_arn, vpc_arn, "BELONGS_TO_VPC", action)
+
+    def normalize_cloudtrail(self, ct_diff: Dict[str, Any]):
+        """Normalize CloudTrail trails & logging status (Crucial for Log Deletion Analysis)."""
+        for change_type in ["added", "removed", "modified"]:
+            raw_data = ct_diff.get(change_type, {})
+            action = change_type.upper()
+
+            trails = self._to_list(raw_data.get("trails", raw_data) if isinstance(raw_data, dict) else raw_data)
+            for trail in trails:
+                t_name = trail.get("Name", "default")
+                t_arn = trail.get("TrailARN") or self.format_arn("cloudtrail", "trail", t_name)
+                is_logging = trail.get("is_logging", True)
+
+                # Flag log deletion / stopping as critical security alert
+                security_alert = "LOG_STOPPED_OR_DELETED" if (not is_logging or action == "REMOVED") else "NORMAL"
+
+                props = {
+                    "Name": t_name,
+                    "is_logging": is_logging,
+                    "S3BucketName": trail.get("S3BucketName", ""),
+                    "SecurityAlert": security_alert
+                }
+
+                self.add_node(
+                    node_id=t_arn,
+                    labels=["Resource", "CloudTrail", "Trail"],
+                    change_type=action,
+                    props=props
+                )
+
+                # Link Trail to its underlying S3 Audit Log Bucket
+                if trail.get("S3BucketName"):
+                    s3_arn = self.format_arn("s3", "bucket", trail.get("S3BucketName"))
+                    self.add_relationship(t_arn, s3_arn, "LOGS_TO_BUCKET", action)
+
+    def process_diff(self, raw_diff: Dict[str, Any]) -> Dict[str, Any]:
+        """Main normalization processing pipeline."""
+        if "iam" in raw_diff:
+            self.normalize_iam(raw_diff["iam"])
+        if "s3" in raw_diff:
+            self.normalize_s3(raw_diff["s3"])
+        if "security_group" in raw_diff:
+            self.normalize_security_groups(raw_diff["security_group"])
+        if "cloudtrail" in raw_diff:
+            self.normalize_cloudtrail(raw_diff["cloudtrail"])
+
+        return {
+            "summary": {
+                "total_nodes": len(self.nodes),
+                "total_relationships": len(self.relationships)
+            },
+            "graph": {
+                "nodes": self.nodes,
+                "relationships": self.relationships
+            }
+        }
+
 
 def main():
-    if len(sys.argv) < 3:
-        print("usage: python normalize_diff.py <diff.json> <out_dir>")
-        sys.exit(1)
+    input_file = "diff.json"
+    output_file = "normalized_diff.json"
 
-    src, out_dir = sys.argv[1], Path(sys.argv[2])
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if len(sys.argv) > 1:
+        input_file = sys.argv[1]
+    if len(sys.argv) > 2:
+        output_file = sys.argv[2]
 
-    with open(src, encoding="utf-8") as f:
-        diff_json = json.load(f)
+    if not os.path.exists(input_file):
+        logger.error(f"Input diff file '{input_file}' not found.")
+        raise FileNotFoundError(f"Required input file '{input_file}' does not exist.")
 
-    norm = normalize(diff_json)
+    try:
+        with open(input_file, "r", encoding="utf-8") as f:
+            raw_diff = json.load(f)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON from '{input_file}': {e}")
+        raise
 
-    write_csv(out_dir / "nodes_resources.csv", norm["resources"])
-    write_csv(out_dir / "nodes_entities.csv", norm["entities"])
-    write_csv(out_dir / "events.csv", norm["events"])
-    write_csv(out_dir / "rel_resource_event.csv", norm["rel_resource_event"])
-    write_csv(out_dir / "rel_resource_entity.csv", norm["rel_resource_entity"])
+    normalizer = SchemaNormalizer()
+    normalized_data = normalizer.process_diff(raw_diff)
 
-    print(f"resources={len(norm['resources'])} entities={len(norm['entities'])} "
-          f"events={len(norm['events'])} rel_r_e={len(norm['rel_resource_event'])} "
-          f"rel_r_ent={len(norm['rel_resource_entity'])}")
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(normalized_data, f, indent=2, ensure_ascii=False)
+
+    logger.info(f"Normalization complete: {normalized_data['summary']['total_nodes']} nodes, {normalized_data['summary']['total_relationships']} relationships.")
+    logger.info(f"Output saved to '{output_file}'")
+
 
 if __name__ == "__main__":
     main()
