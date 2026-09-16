@@ -116,11 +116,6 @@ python neo4j_loader.py
 
 ---
 
-## 🔄 데이터 분석 파이프라인 (Workflow)
-
-$$\text{AWS Infra} \xrightarrow[\text{Boto3}]{\text{snapshot.py}} \text{Snapshots (JSON)} \xrightarrow{\text{diff.py}} \text{Diff Data} \xrightarrow{\text{normalize \& cypher}} \text{Cypher Queries} \xrightarrow{\text{neo4j\_loader.py}} \mathbf{Neo4j\ Graph\ DB}$$
-
----
 
 ## 📄 참고 문서 (Documentation)
 
