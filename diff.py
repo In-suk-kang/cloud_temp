@@ -1,672 +1,194 @@
+"""
+diff.py - AWS Security Snapshot Analysis Pipeline (Refactored)
+Compares JSON snapshots from 'before' and 'after' directories to detect added, removed, and modified resources.
+Outputs structured diff.json for normalize_diff.py.
+"""
+
+import argparse
 import json
-from pathlib import Path
-from datetime import datetime
+import logging
+import os
+import sys
+from typing import Dict, List, Any, Optional, Union
 
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("diff_extractor")
 
-# ============================================================
-# 설정
-# ============================================================
-
-BASE_DIR = Path(__file__).resolve().parent
-
-BEFORE_DIR = BASE_DIR / "snapshots" / "before"
-AFTER_DIR = BASE_DIR / "snapshots" / "after"
-
-OUTPUT_DIR = BASE_DIR / "diffs"
-
-
-# ============================================================
-# Resource Anchor
-# ============================================================
-
-RESOURCE_KEYS = {
-    "iam": {
-        "users": "user_id",
-        "groups": "group_id",
-        "roles": "role_id"
-    },
-    "security_group": {
-        "resources": "group_id"
-    },
-    "ec2": {
-        "resources": "instance_id"
-    },
-    "s3": {
-        "resources": "name"
-    },
-    "vpc": {
-        "vpcs": "vpc_id",
-        "subnets": "subnet_id",
-        "route_tables": "route_table_id",
-        "internet_gateways": "internet_gateway_id",
-        "network_acls": "network_acl_id"
-    },
-    "cloudtrail": {
-        "resources": "trail_arn"
-    }
+# Default service snapshot files
+SERVICE_FILES = {
+    "iam": "iam.json",
+    "security_group": "security_group.json",
+    "ec2": "ec2.json",
+    "s3": "s3.json",
+    "vpc": "vpc.json",
+    "cloudtrail": "cloudtrail.json"
 }
 
-
-# ============================================================
-# Noise 제거
-# ============================================================
-
-IGNORED_KEYS = {
-    "ResponseMetadata"
-}
-
-
-def remove_ignored_fields(obj):
-    """
-    AWS API 응답에서 State Drift 분석에 필요 없는
-    ResponseMetadata를 재귀적으로 제거한다.
-    """
-
-    if isinstance(obj, dict):
-
-        return {
-            key: remove_ignored_fields(value)
-            for key, value in obj.items()
-            if key not in IGNORED_KEYS
-        }
-
-    elif isinstance(obj, list):
-
-        return [
-            remove_ignored_fields(item)
-            for item in obj
-        ]
-
-    return obj
-
-
-# ============================================================
-# JSON Load
-# ============================================================
-
-def load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def find_json(directory, prefix):
-    """
-    directory에서 prefix로 시작하는 JSON 파일을 찾는다.
-    """
-
-    files = sorted(directory.glob(f"{prefix}*.json"))
-
-    if not files:
-        raise FileNotFoundError(
-            f"파일을 찾을 수 없습니다: {directory}/{prefix}*.json"
-        )
-
-    return files[-1]
-
-
-# ============================================================
-# Normalize
-# ============================================================
-
-def normalize(obj):
-    """
-    Dictionary key 순서 및 List 순서 차이를 제거한다.
-    """
-
-    if isinstance(obj, dict):
-
-        return {
-            key: normalize(value)
-            for key, value in sorted(obj.items())
-        }
-
-    if isinstance(obj, list):
-
-        normalized = [
-            normalize(item)
-            for item in obj
-        ]
-
-        try:
-            return sorted(
-                normalized,
-                key=lambda x: json.dumps(
-                    x,
-                    sort_keys=True,
-                    default=str
-                )
-            )
-        except Exception:
-            return normalized
-
-    return obj
-
-
-# ============================================================
-# Deep Diff
-# ============================================================
-
-def deep_diff(before, after, path=""):
-    changes = []
-
-    # Dictionary
-    if isinstance(before, dict) and isinstance(after, dict):
-
-        all_keys = set(before.keys()) | set(after.keys())
-
-        for key in sorted(all_keys):
-
-            current_path = (
-                f"{path}.{key}"
-                if path
-                else key
-            )
-
-            if key not in before:
-
-                changes.append({
-                    "type": "ADDED",
-                    "path": current_path,
-                    "before": None,
-                    "after": after[key]
-                })
-
-            elif key not in after:
-
-                changes.append({
-                    "type": "REMOVED",
-                    "path": current_path,
-                    "before": before[key],
-                    "after": None
-                })
-
-            else:
-
-                changes.extend(
-                    deep_diff(
-                        before[key],
-                        after[key],
-                        current_path
-                    )
-                )
-
-        return changes
-
-    # List
-    if isinstance(before, list) and isinstance(after, list):
-
-        before_normalized = normalize(before)
-        after_normalized = normalize(after)
-
-        if before_normalized != after_normalized:
-
-            changes.append({
-                "type": "CHANGED",
-                "path": path,
-                "before": before,
-                "after": after
-            })
-
-        return changes
-
-    # Primitive
-    if before != after:
-
-        changes.append({
-            "type": "CHANGED",
-            "path": path,
-            "before": before,
-            "after": after
-        })
-
-    return changes
-
-
-# ============================================================
-# Resource Index
-# ============================================================
-
-def index_resources(resources, key):
-    """
-    Resource Anchor를 기준으로 dictionary 형태로 변환.
-    """
-
-    result = {}
-
-    for resource in resources:
-
-        resource_id = resource.get(key)
-
-        if resource_id is not None:
-            result[str(resource_id)] = resource
-
-    return result
-
-
-# ============================================================
-# Resource Diff
-# ============================================================
-
-def diff_resource_list(
-    before_resources,
-    after_resources,
-    resource_key
-):
-
-    before_map = index_resources(
-        before_resources,
-        resource_key
-    )
-
-    after_map = index_resources(
-        after_resources,
-        resource_key
-    )
-
-    added = []
-    removed = []
-    changed = []
-
-    # Added
-    for resource_id in after_map:
-
-        if resource_id not in before_map:
-
-            added.append({
-                "resource_id": resource_id,
-                "resource": after_map[resource_id]
-            })
-
-    # Removed
-    for resource_id in before_map:
-
-        if resource_id not in after_map:
-
-            removed.append({
-                "resource_id": resource_id,
-                "resource": before_map[resource_id]
-            })
-
-    # Changed
-    for resource_id in before_map:
-
-        if resource_id not in after_map:
-            continue
-
-        before = before_map[resource_id]
-        after = after_map[resource_id]
-
-        # 중요:
-        # ResponseMetadata 제거 후 비교
-        before_clean = remove_ignored_fields(before)
-        after_clean = remove_ignored_fields(after)
-
-        changes = deep_diff(
-            before_clean,
-            after_clean
-        )
-
-        if changes:
-
-            changed.append({
-                "resource_id": resource_id,
-                "changes": changes
-            })
+# Unique identification keys for resource matching
+IDENTIFIER_KEYS = [
+    "Arn", "TrailARN", "UserName", "RoleName", "GroupName", "PolicyArn",
+    "InstanceId", "GroupId", "VpcId", "SubnetId", "Name", "BucketName", "VolumeId"
+]
+
+
+def get_resource_id(item: Dict[str, Any]) -> str:
+    """Extract a unique string identifier from a resource dict."""
+    if not isinstance(item, dict):
+        return str(item)
+    for key in IDENTIFIER_KEYS:
+        if key in item and item[key]:
+            return str(item[key])
+    return json.dumps(item, sort_keys=True)
+
+
+def extract_items_list(data: Any) -> List[Dict[str, Any]]:
+    """Normalize raw JSON data into a flat list of dict items."""
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    elif isinstance(data, dict):
+        items = []
+        for k, v in data.items():
+            if isinstance(v, list):
+                items.extend([x for x in v if isinstance(x, dict)])
+            elif isinstance(v, dict):
+                items.append(v)
+        return items if items else [data]
+    return []
+
+
+def compare_service_snapshots(before_data: Any, after_data: Any) -> Dict[str, List[Dict[str, Any]]]:
+    """Compare 'before' and 'after' snapshot structures for a service."""
+    before_list = extract_items_list(before_data)
+    after_list = extract_items_list(after_data)
+
+    before_map = {get_resource_id(item): item for item in before_list}
+    after_map = {get_resource_id(item): item for item in after_list}
+
+    before_ids = set(before_map.keys())
+    after_ids = set(after_map.keys())
+
+    added_ids = after_ids - before_ids
+    removed_ids = before_ids - after_ids
+    common_ids = before_ids & after_ids
+
+    added = [after_map[rid] for rid in added_ids]
+    removed = [before_map[rid] for rid in removed_ids]
+    modified = []
+
+    for rid in common_ids:
+        b_item = before_map[rid]
+        a_item = after_map[rid]
+
+        # Check for deep structural inequality
+        if b_item != a_item:
+            # Store 'after' state with previous context if modified
+            mod_item = dict(a_item)
+            mod_item["_previous_state"] = b_item
+            modified.append(mod_item)
 
     return {
         "added": added,
         "removed": removed,
-        "changed": changed
+        "modified": modified
     }
 
 
-# ============================================================
-# IAM
-# ============================================================
+class SnapshotDiffExtractor:
+    """Extracts structural differences between before and after snapshot directories."""
 
-def diff_iam(before, after):
+    def __init__(self, before_dir: str = "snapshots/before", after_dir: str = "snapshots/after", output_file: str = "diff.json"):
+        self.before_dir = before_dir
+        self.after_dir = after_dir
+        self.output_file = output_file
 
-    result = {}
+    def validate_directories(self):
+        """Validate existence of before and after snapshot directories."""
+        if not os.path.exists(self.before_dir):
+            logger.error(f"Before snapshot directory '{self.before_dir}' does not exist.")
+            raise FileNotFoundError(f"Directory not found: '{self.before_dir}'")
 
-    for resource_type in [
-        "users",
-        "groups",
-        "roles"
-    ]:
+        if not os.path.exists(self.after_dir):
+            logger.error(f"After snapshot directory '{self.after_dir}' does not exist.")
+            raise FileNotFoundError(f"Directory not found: '{self.after_dir}'")
 
-        key = RESOURCE_KEYS["iam"][resource_type]
+    def run(self) -> Dict[str, Any]:
+        """Execute diff comparison across all service snapshot files."""
+        self.validate_directories()
 
-        result[resource_type] = diff_resource_list(
-            before.get(resource_type, []),
-            after.get(resource_type, []),
-            key
-        )
+        diff_result = {}
+        total_changes = 0
 
-    return result
+        for service_name, file_name in SERVICE_FILES.items():
+            before_path = os.path.join(self.before_dir, file_name)
+            after_path = os.path.join(self.after_dir, file_name)
 
+            before_data = None
+            after_data = None
 
-# ============================================================
-# Security Group
-# ============================================================
+            if os.path.exists(before_path):
+                try:
+                    with open(before_path, "r", encoding="utf-8") as f:
+                        before_data = json.load(f)
+                except Exception as e:
+                    logger.warning(f"Failed to read '{before_path}': {e}")
 
-def diff_security_group(before, after):
+            if os.path.exists(after_path):
+                try:
+                    with open(after_path, "r", encoding="utf-8") as f:
+                        after_data = json.load(f)
+                except Exception as e:
+                    logger.warning(f"Failed to read '{after_path}': {e}")
 
-    return diff_resource_list(
-        before.get("resources", []),
-        after.get("resources", []),
-        RESOURCE_KEYS["security_group"]["resources"]
-    )
+            if before_data is None and after_data is None:
+                logger.info(f"Skipping service '{service_name}': Neither before nor after snapshots found.")
+                continue
 
+            service_diff = compare_service_snapshots(before_data or {}, after_data or {})
+            
+            changes_count = (
+                len(service_diff["added"]) +
+                len(service_diff["removed"]) +
+                len(service_diff["modified"])
+            )
+            total_changes += changes_count
 
-# ============================================================
-# EC2
-# ============================================================
-
-def diff_ec2(before, after):
-
-    return diff_resource_list(
-        before.get("resources", []),
-        after.get("resources", []),
-        RESOURCE_KEYS["ec2"]["resources"]
-    )
-
-
-# ============================================================
-# S3
-# ============================================================
-
-def diff_s3(before, after):
-
-    return diff_resource_list(
-        before.get("resources", []),
-        after.get("resources", []),
-        RESOURCE_KEYS["s3"]["resources"]
-    )
-
-
-# ============================================================
-# VPC
-# ============================================================
-
-def diff_vpc(before, after):
-
-    result = {}
-
-    for resource_type in [
-        "vpcs",
-        "subnets",
-        "route_tables",
-        "internet_gateways",
-        "network_acls"
-    ]:
-
-        key = RESOURCE_KEYS["vpc"][resource_type]
-
-        result[resource_type] = diff_resource_list(
-            before.get(resource_type, []),
-            after.get(resource_type, []),
-            key
-        )
-
-    return result
-
-
-# ============================================================
-# CloudTrail
-# ============================================================
-
-def diff_cloudtrail(before, after):
-
-    return diff_resource_list(
-        before.get("resources", []),
-        after.get("resources", []),
-        RESOURCE_KEYS["cloudtrail"]["resources"]
-    )
-
-
-# ============================================================
-# Resource Type 처리
-# ============================================================
-
-def process_resource(
-    resource_name,
-    before_data,
-    after_data
-):
-
-    name = resource_name.lower()
-
-    if name == "iam":
-        return diff_iam(
-            before_data,
-            after_data
-        )
-
-    elif name == "security_group":
-        return diff_security_group(
-            before_data,
-            after_data
-        )
-
-    elif name == "ec2":
-        return diff_ec2(
-            before_data,
-            after_data
-        )
-
-    elif name == "s3":
-        return diff_s3(
-            before_data,
-            after_data
-        )
-
-    elif name == "vpc":
-        return diff_vpc(
-            before_data,
-            after_data
-        )
-
-    elif name == "cloudtrail":
-        return diff_cloudtrail(
-            before_data,
-            after_data
-        )
-
-    return {}
-
-
-# ============================================================
-# Summary
-# ============================================================
-
-def print_summary(resource_name, diff):
-
-    print()
-    print("=" * 70)
-    print(f"[{resource_name}]")
-    print("=" * 70)
-
-    def count(data):
-
-        if isinstance(data, dict):
-
-            return (
-                len(data.get("added", [])),
-                len(data.get("removed", [])),
-                len(data.get("changed", []))
+            diff_result[service_name] = service_diff
+            logger.info(
+                f"Service '{service_name}': {len(service_diff['added'])} added, "
+                f"{len(service_diff['removed'])} removed, {len(service_diff['modified'])} modified."
             )
 
-        return 0, 0, 0
+        with open(self.output_file, "w", encoding="utf-8") as f:
+            json.dump(diff_result, f, indent=2, ensure_ascii=False)
 
-    total_added = 0
-    total_removed = 0
-    total_changed = 0
+        logger.info(f"Diff extraction complete ({total_changes} total changes detected). Output saved to '{self.output_file}'.")
+        return diff_result
 
-    if isinstance(diff, dict):
-
-        for _, value in diff.items():
-
-            added, removed, changed = count(value)
-
-            total_added += added
-            total_removed += removed
-            total_changed += changed
-
-    print(f"ADDED   : {total_added}")
-    print(f"REMOVED : {total_removed}")
-    print(f"CHANGED : {total_changed}")
-
-
-# ============================================================
-# Main
-# ============================================================
 
 def main():
+    parser = argparse.ArgumentParser(description="Extract diffs between AWS security snapshot directories.")
+    parser.add_argument("--before", default="snapshots/before", help="Path to 'before' snapshot directory")
+    parser.add_argument("--after", default="snapshots/after", help="Path to 'after' snapshot directory")
+    parser.add_argument("--output", default="diff.json", help="Path to output diff.json file")
 
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True
+    args = parser.parse_args()
+
+    extractor = SnapshotDiffExtractor(
+        before_dir=args.before,
+        after_dir=args.after,
+        output_file=args.output
     )
-
-    timestamp = datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
-    )
-
-    resources = {}
-
-    resource_files = {
-        "IAM": "iam",
-        "SECURITY_GROUP": "security_group",
-        "EC2": "ec2",
-        "S3": "s3",
-        "VPC": "vpc",
-        "CLOUDTRAIL": "cloudtrail"
-    }
-
-    print()
-    print("=" * 70)
-    print("AWS State Drift Analysis")
-    print("=" * 70)
-
-    for resource_name, prefix in resource_files.items():
-
-        print(f"\n[{resource_name}] 분석 중...")
-
-        try:
-
-            before_file = find_json(
-                BEFORE_DIR,
-                prefix
-            )
-
-            after_file = find_json(
-                AFTER_DIR,
-                prefix
-            )
-
-            before_data = load_json(
-                before_file
-            )
-
-            after_data = load_json(
-                after_file
-            )
-
-            # snapshot.py에서 저장한 wrapper 제거
-            before_resources = before_data.get(
-                "resources",
-                before_data
-            )
-
-            after_resources = after_data.get(
-                "resources",
-                after_data
-            )
-
-            diff = process_resource(
-                resource_name,
-                before_resources,
-                after_resources
-            )
-
-            resources[resource_name] = {
-                "resource_type": resource_name,
-                "before_timestamp": before_data.get(
-                    "timestamp"
-                ),
-                "after_timestamp": after_data.get(
-                    "timestamp"
-                ),
-                "diff": diff
-            }
-
-            print_summary(
-                resource_name,
-                diff
-            )
-
-            # 개별 diff 저장
-            individual_output = (
-                OUTPUT_DIR /
-                f"{prefix}_diff.json"
-            )
-
-            with open(
-                individual_output,
-                "w",
-                encoding="utf-8"
-            ) as f:
-
-                json.dump(
-                    diff,
-                    f,
-                    indent=2,
-                    ensure_ascii=False,
-                    default=str
-                )
-
-        except Exception as e:
-
-            print(
-                f"[ERROR] {resource_name}: {e}"
-            )
-
-    # ========================================================
-    # 전체 결과
-    # ========================================================
-
-    result = {
-        "analysis_timestamp": datetime.now().astimezone().isoformat(),
-        "before_directory": str(BEFORE_DIR),
-        "after_directory": str(AFTER_DIR),
-        "resources": resources
-    }
-
-    output_file = (
-        OUTPUT_DIR /
-        f"diff_{timestamp}.json"
-    )
-
-    with open(
-        output_file,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            result,
-            f,
-            indent=2,
-            ensure_ascii=False,
-            default=str
-        )
- 
-    print()
-    print("=" * 70)
-    print("분석 완료")
-    print("=" * 70)
-    print(f"전체 결과: {output_file}")
-    print(f"개별 결과: {OUTPUT_DIR}")
+    
+    try:
+        extractor.run()
+    except Exception as e:
+        logger.error(f"Diff extraction failed: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
