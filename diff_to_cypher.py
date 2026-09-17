@@ -1,5 +1,5 @@
 """
-diff_to_cypher-v3.py - AWS Security Snapshot Analysis Pipeline (Refactored v3)
+diff_to_cypher-v4.py - AWS Security Snapshot Analysis Pipeline (Refactored v4)
 Converts normalized_diff.json into executable Cypher queries for Neo4j.
 """
 
@@ -86,9 +86,11 @@ def generate_cypher(normalized_data: Dict[str, Any]) -> List[str]:
             prop_str_list = [f"{k}: {escape_cypher_value(v)}" for k, v in props.items()]
             prop_clause = "{" + ", ".join(prop_str_list) + "}" if prop_str_list else "{}"
 
+            # MERGE both source and target nodes so relationships are ALWAYS created even if target node was omitted
             if change_type in ["ADDED", "MODIFIED"]:
                 cypher = (
-                    f"MATCH (src {{id: {escape_cypher_value(source_id)}}}), (tgt {{id: {escape_cypher_value(target_id)}}}) "
+                    f"MERGE (src:Resource {{id: {escape_cypher_value(source_id)}}}) "
+                    f"MERGE (tgt:Resource {{id: {escape_cypher_value(target_id)}}}) "
                     f"MERGE (src)-[r:{rel_type}]->(tgt) "
                     f"SET r += {prop_clause};"
                 )
